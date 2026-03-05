@@ -46,6 +46,11 @@ initBot();
 
 // Routes
 
+// Root route - redirect to dashboard
+app.get('/', (req, res) => {
+  res.redirect('/dashboard');
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({
