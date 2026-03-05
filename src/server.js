@@ -1,12 +1,17 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import QRCode from 'qrcode';
+import { Boom } from '@hapi/boom';
+import {
+  default as makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import QRCode from 'qrcode';
-import { initializeBaileys, getQRCode, isConnected } from './baileys-service.js';
-import { handleMessage } from './message-handler.js';
-import { initializeDatabase } from './db.js';
 
 dotenv.config();
 
@@ -17,36 +22,76 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, '..', 'public')));
 
-// Initialize database
-await initializeDatabase();
+// Global variables
+let sock = null;
+let qrCode = null;
+let connectionStatus = 'disconnected';
 
 // Initialize Baileys
-let sock = null;
-
-async function initBot() {
+async function initBaileys() {
   try {
-    sock = await initializeBaileys(
-      (qr) => {
-        console.log('QR Code gerado');
-      },
-      (msg) => {
-        handleMessage(msg, sock);
+    console.log('🔄 Inicializando Baileys...');
+    
+    const sessionsDir = path.join(__dirname, '..', 'sessions');
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(sessionsDir);
+
+    sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: true,
+      logger: pino({ level: 'silent' }),
+      browser: ['Ubuntu', 'Chrome', '120.0.0.0'],
+      shouldIgnoreJid: (jid) => false,
+    });
+
+    // Handle connection updates
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        console.log('✅ QR Code gerado!');
+        qrCode = qr;
+        connectionStatus = 'qr_pending';
       }
-    );
+
+      if (connection === 'open') {
+        console.log('✅ Conectado ao WhatsApp!');
+        connectionStatus = 'connected';
+        qrCode = null;
+      } else if (connection === 'close') {
+        const shouldReconnect =
+          (lastDisconnect?.error instanceof Boom)?.output?.statusCode !==
+          DisconnectReason.loggedOut;
+
+        console.log('❌ Desconectado. Reconectando:', shouldReconnect);
+        connectionStatus = 'disconnected';
+
+        if (shouldReconnect) {
+          setTimeout(() => initBaileys(), 3000);
+        }
+      }
+    });
+
+    // Save credentials
+    sock.ev.on('creds.update', saveCreds);
+
+    console.log('✅ Baileys inicializado com sucesso!');
   } catch (error) {
-    console.error('Erro ao inicializar bot:', error);
-    setTimeout(initBot, 5000); // Retry after 5 seconds
+    console.error('❌ Erro ao inicializar Baileys:', error);
+    setTimeout(() => initBaileys(), 5000);
   }
 }
 
-// Start bot
-initBot();
+// Start Baileys
+initBaileys();
 
 // Routes
 
-// Root route - redirect to dashboard
+// Root
 app.get('/', (req, res) => {
   res.redirect('/dashboard');
 });
@@ -55,7 +100,7 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    connected: isConnected(),
+    connection: connectionStatus,
     timestamp: new Date().toISOString()
   });
 });
@@ -63,38 +108,35 @@ app.get('/health', (req, res) => {
 // Get QR Code
 app.get('/api/qr', async (req, res) => {
   try {
-    const qr = getQRCode();
-    
-    if (!qr) {
+    if (!qrCode) {
       return res.json({
-        status: 'connected',
-        message: 'Bot já está conectado'
+        status: connectionStatus === 'connected' ? 'connected' : 'waiting',
+        message: connectionStatus === 'connected' ? 'Bot conectado' : 'Aguardando QR Code...'
       });
     }
 
-    // Generate QR code image
-    const qrImage = await QRCode.toDataURL(qr);
-    
+    const qrImage = await QRCode.toDataURL(qrCode);
     res.json({
       status: 'pending',
       qr: qrImage,
-      text: qr
+      text: qrCode
     });
   } catch (error) {
-    console.error('Erro ao gerar QR code:', error);
-    res.status(500).json({ error: 'Erro ao gerar QR code' });
+    console.error('Erro ao gerar QR:', error);
+    res.status(500).json({ error: 'Erro ao gerar QR Code' });
   }
 });
 
-// Get bot status
+// Get status
 app.get('/api/status', (req, res) => {
   res.json({
-    connected: isConnected(),
+    status: connectionStatus,
+    connected: connectionStatus === 'connected',
     timestamp: new Date().toISOString()
   });
 });
 
-// Dashboard HTML
+// Dashboard
 app.get('/dashboard', (req, res) => {
   const html = `
 <!DOCTYPE html>
@@ -102,16 +144,11 @@ app.get('/dashboard', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WhatsApp Bot Dashboard</title>
+    <title>WhatsApp Bot - Investindo do Zero</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             display: flex;
@@ -119,32 +156,20 @@ app.get('/dashboard', (req, res) => {
             justify-content: center;
             padding: 20px;
         }
-
         .container {
             background: white;
             border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             max-width: 600px;
             width: 100%;
             padding: 40px;
         }
-
         .header {
             text-align: center;
             margin-bottom: 40px;
         }
-
-        .header h1 {
-            color: #333;
-            font-size: 28px;
-            margin-bottom: 10px;
-        }
-
-        .header p {
-            color: #666;
-            font-size: 14px;
-        }
-
+        .header h1 { color: #333; font-size: 28px; margin-bottom: 10px; }
+        .header p { color: #666; font-size: 14px; }
         .status-box {
             background: #f5f5f5;
             border-radius: 12px;
@@ -152,47 +177,21 @@ app.get('/dashboard', (req, res) => {
             margin-bottom: 30px;
             text-align: center;
         }
-
         .status-indicator {
             display: inline-block;
             width: 12px;
             height: 12px;
             border-radius: 50%;
             margin-right: 8px;
-            animation: pulse 2s infinite;
-        }
-
-        .status-indicator.connected {
-            background: #4caf50;
-        }
-
-        .status-indicator.disconnected {
             background: #f44336;
-            animation: none;
         }
-
-        .status-text {
-            font-size: 16px;
-            font-weight: 600;
-            color: #333;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-
+        .status-indicator.connected { background: #4caf50; }
+        .status-text { font-size: 16px; font-weight: 600; color: #333; }
         .qr-container {
             text-align: center;
             margin: 30px 0;
         }
-
-        .qr-container h3 {
-            color: #333;
-            margin-bottom: 20px;
-            font-size: 16px;
-        }
-
+        .qr-container h3 { color: #333; margin-bottom: 20px; font-size: 16px; }
         #qrImage {
             max-width: 300px;
             width: 100%;
@@ -201,7 +200,6 @@ app.get('/dashboard', (req, res) => {
             padding: 10px;
             background: white;
         }
-
         .instructions {
             background: #e3f2fd;
             border-left: 4px solid #2196f3;
@@ -211,73 +209,20 @@ app.get('/dashboard', (req, res) => {
             font-size: 14px;
             color: #1565c0;
         }
-
-        .info-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            margin: 20px 0;
-        }
-
-        .info-item {
-            background: #f5f5f5;
-            padding: 15px;
-            border-radius: 8px;
-            text-align: center;
-        }
-
-        .info-item label {
-            display: block;
-            font-size: 12px;
-            color: #999;
-            margin-bottom: 5px;
-            text-transform: uppercase;
-        }
-
-        .info-item value {
-            display: block;
-            font-size: 18px;
-            font-weight: 600;
-            color: #333;
-        }
-
-        .button-group {
-            display: flex;
-            gap: 10px;
-            margin-top: 20px;
-        }
-
         button {
-            flex: 1;
+            width: 100%;
             padding: 12px;
+            margin-top: 20px;
             border: none;
             border-radius: 8px;
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        .btn-primary {
             background: #667eea;
             color: white;
+            transition: all 0.3s ease;
         }
-
-        .btn-primary:hover {
-            background: #5568d3;
-            transform: translateY(-2px);
-        }
-
-        .btn-secondary {
-            background: #f5f5f5;
-            color: #333;
-            border: 1px solid #ddd;
-        }
-
-        .btn-secondary:hover {
-            background: #efefef;
-        }
-
+        button:hover { background: #5568d3; transform: translateY(-2px); }
         .logs {
             background: #1e1e1e;
             color: #00ff00;
@@ -289,65 +234,40 @@ app.get('/dashboard', (req, res) => {
             overflow-y: auto;
             margin-top: 20px;
         }
-
-        .log-entry {
-            margin: 5px 0;
-        }
-
-        .log-entry.error {
-            color: #ff6b6b;
-        }
-
-        .log-entry.success {
-            color: #51cf66;
-        }
-
-        .log-entry.info {
-            color: #74c0fc;
-        }
+        .log-entry { margin: 5px 0; }
+        .log-entry.error { color: #ff6b6b; }
+        .log-entry.success { color: #51cf66; }
+        .log-entry.info { color: #74c0fc; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>🤖 WhatsApp Bot</h1>
-            <p>Investindo do Zero - Análise de Produtos</p>
+            <p>Investindo do Zero</p>
         </div>
 
         <div class="status-box">
-            <span class="status-indicator disconnected" id="statusIndicator"></span>
+            <span class="status-indicator" id="statusIndicator"></span>
             <span class="status-text" id="statusText">Desconectado</span>
         </div>
 
         <div class="qr-container" id="qrContainer" style="display: none;">
-            <h3>📱 Escaneie o QR Code com seu WhatsApp</h3>
+            <h3>📱 Escaneie o QR Code</h3>
             <img id="qrImage" src="" alt="QR Code">
             <div class="instructions">
                 <strong>Como conectar:</strong>
                 <ol style="margin-left: 20px; margin-top: 10px;">
-                    <li>Abra seu WhatsApp</li>
-                    <li>Vá para Configurações → Dispositivos Conectados</li>
-                    <li>Clique em "Conectar um Dispositivo"</li>
-                    <li>Aponte a câmera para este QR Code</li>
+                    <li>Abra WhatsApp no iPhone</li>
+                    <li>Configurações → Dispositivos Conectados</li>
+                    <li>Conectar um Dispositivo</li>
+                    <li>Aponte para este QR Code</li>
                 </ol>
             </div>
         </div>
 
-        <div class="info-grid">
-            <div class="info-item">
-                <label>Mensagens Processadas</label>
-                <value id="messageCount">0</value>
-            </div>
-            <div class="info-item">
-                <label>Análises Realizadas</label>
-                <value id="analysisCount">0</value>
-            </div>
-        </div>
-
-        <div class="button-group">
-            <button class="btn-primary" onclick="refreshQR()">Atualizar QR</button>
-            <button class="btn-secondary" onclick="checkStatus()">Verificar Status</button>
-        </div>
+        <button onclick="refreshQR()">🔄 Atualizar QR</button>
+        <button onclick="checkStatus()" style="background: #666;">✓ Verificar Status</button>
 
         <div class="logs" id="logs">
             <div class="log-entry info">Sistema iniciado...</div>
@@ -355,21 +275,19 @@ app.get('/dashboard', (req, res) => {
     </div>
 
     <script>
-        const API_BASE = window.location.origin;
-
-        function addLog(message, type = 'info') {
-            const logsDiv = document.getElementById('logs');
+        function addLog(msg, type = 'info') {
+            const logs = document.getElementById('logs');
             const entry = document.createElement('div');
             entry.className = \`log-entry \${type}\`;
-            entry.textContent = \`[\${new Date().toLocaleTimeString()}] \${message}\`;
-            logsDiv.appendChild(entry);
-            logsDiv.scrollTop = logsDiv.scrollHeight;
+            entry.textContent = \`[\${new Date().toLocaleTimeString()}] \${msg}\`;
+            logs.appendChild(entry);
+            logs.scrollTop = logs.scrollHeight;
         }
 
         async function checkStatus() {
             try {
-                const response = await fetch(\`\${API_BASE}/api/status\`);
-                const data = await response.json();
+                const res = await fetch('/api/status');
+                const data = await res.json();
                 
                 const indicator = document.getElementById('statusIndicator');
                 const statusText = document.getElementById('statusText');
@@ -377,41 +295,44 @@ app.get('/dashboard', (req, res) => {
                 if (data.connected) {
                     indicator.className = 'status-indicator connected';
                     statusText.textContent = '✅ Conectado';
-                    addLog('Bot conectado com sucesso!', 'success');
+                    addLog('Bot conectado!', 'success');
                     document.getElementById('qrContainer').style.display = 'none';
                 } else {
-                    indicator.className = 'status-indicator disconnected';
+                    indicator.className = 'status-indicator';
                     statusText.textContent = '❌ Desconectado';
                     addLog('Bot desconectado. Escaneie o QR Code.', 'error');
                     refreshQR();
                 }
             } catch (error) {
-                addLog('Erro ao verificar status: ' + error.message, 'error');
+                addLog('Erro: ' + error.message, 'error');
             }
         }
 
         async function refreshQR() {
             try {
-                const response = await fetch(\`\${API_BASE}/api/qr\`);
-                const data = await response.json();
+                addLog('Buscando QR Code...', 'info');
+                const res = await fetch('/api/qr');
+                const data = await res.json();
                 
                 if (data.status === 'pending') {
                     document.getElementById('qrImage').src = data.qr;
                     document.getElementById('qrContainer').style.display = 'block';
-                    addLog('QR Code gerado. Escaneie para conectar.', 'info');
+                    addLog('QR Code gerado!', 'success');
                 } else if (data.status === 'connected') {
                     document.getElementById('qrContainer').style.display = 'none';
+                    addLog('Bot já está conectado!', 'success');
                     checkStatus();
+                } else {
+                    addLog('Aguardando QR Code...', 'info');
                 }
             } catch (error) {
-                addLog('Erro ao gerar QR Code: ' + error.message, 'error');
+                addLog('Erro ao gerar QR: ' + error.message, 'error');
             }
         }
 
-        // Check status on load
+        // Auto-check every 5 seconds
         window.addEventListener('load', () => {
             checkStatus();
-            // Check every 5 seconds
             setInterval(checkStatus, 5000);
         });
     </script>
