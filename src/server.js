@@ -23,7 +23,7 @@ app.use(cors());
 app.use(express.json());
 
 let sock = null;
-let qrCode = 'https://web-production-3d7ac.up.railway.app/dashboard'; // QR com link válido
+let qrCode = '81903865-2303'; // Número do WhatsApp Business
 let isConnected = false;
 let baileyInitialized = false;
 
