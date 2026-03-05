@@ -23,7 +23,7 @@ app.use(cors());
 app.use(express.json());
 
 let sock = null;
-let qrCode = 'TEST_QR_CODE_PLACEHOLDER'; // QR de teste inicial
+let qrCode = 'https://web-production-3d7ac.up.railway.app/dashboard'; // QR com link válido
 let isConnected = false;
 let baileyInitialized = false;
 
